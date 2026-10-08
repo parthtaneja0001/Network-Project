@@ -1,0 +1,7 @@
+# Python compiled artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# System files
+.DS_Store
