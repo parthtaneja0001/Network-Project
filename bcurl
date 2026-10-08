@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+import sys
+import os
+import socket
+from protocol import (
+    FRAME_HEADER_SIZE,
+    FRAME_TYPE_DATA,
+    FRAME_TYPE_HEADERS,
+    FRAME_TYPE_PING,
+    FRAME_TYPE_GOAWAY,
+    FLAG_END_STREAM,
+    FLAG_END_HEADERS,
+    FrameHeader,
+    read_exact,
+    encode_headers,
+    decode_headers,
+    print_hexdump
+)
+
+def parse_url(url_str: str):
+    host = "127.0.0.1"
+    port = 9000
+    path = "/"
+
+    copy = url_str
+    if copy.startswith("http://"):
+        copy = copy[len("http://"):]
+    elif copy.startswith("bhttp://"):
+        copy = copy[len("bhttp://"):]
+
+    if "/" in copy:
+        parts = copy.split("/", 1)
+        target_hostport = parts[0]
+        path = "/" + parts[1]
+    else:
+        target_hostport = copy
+
+    if ":" in target_hostport:
+        h, p = target_hostport.split(":", 1)
+        if h:
+            host = h
+        try:
+            port = int(p)
+        except ValueError:
+            raise ValueError(f"Invalid port: {p}")
+    elif target_hostport:
+        host = target_hostport
+
+    if not 1 <= port <= 65535:
+        raise ValueError(f"Port out of range: {port}")
+
+    return host, port, path
+
+def main():
+    verbose = False
+    url_arg = None
+
+    for arg in sys.argv[1:]:
+        if arg == "-v":
+            verbose = True
+        elif not url_arg:
+            url_arg = arg
+
+    if not url_arg:
+        sys.stderr.write(f"Usage: {sys.argv[0]} [-v] <host:port/path>\n")
+        sys.exit(1)
+
+    try:
+        host, port, path = parse_url(url_arg)
+    except ValueError as e:
+        sys.stderr.write(f"{e}\n")
+        sys.exit(1)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.connect((host, port))
+    except Exception as e:
+        sys.stderr.write(f"Connection to {host}:{port} failed: {e}\n")
+        sys.exit(1)
+
+    headers = [
+        (":method", "GET"),
+        (":path", path),
+        ("host", f"{host}:{port}"),
+        ("user-agent", "bcurl/1.0")
+    ]
+
+    payload = encode_headers(headers)
+    req_hdr = FrameHeader(len(payload), FRAME_TYPE_HEADERS, FLAG_END_HEADERS | FLAG_END_STREAM, 1)
+
+    full_req_frame = req_hdr.pack() + payload
+    if verbose:
+        print_hexdump("REQUEST FRAME SENT", full_req_frame, req_hdr)
+
+    try:
+        sock.sendall(full_req_frame)
+    except Exception as e:
+        sys.stderr.write(f"Failed to send request: {e}\n")
+        sock.close()
+        sys.exit(1)
+
+    status_code = 200
+
+    while True:
+        header_bytes = read_exact(sock, FRAME_HEADER_SIZE)
+        if not header_bytes or len(header_bytes) < FRAME_HEADER_SIZE:
+            break
+
+        try:
+            resp_hdr = FrameHeader.unpack(header_bytes)
+        except ValueError as ve:
+            sys.stderr.write(f"Error unpacking response header: {ve}\n")
+            break
+
+        payload_bytes = b""
+        if resp_hdr.length > 0:
+            payload_bytes = read_exact(sock, resp_hdr.length)
+            if len(payload_bytes) < resp_hdr.length:
+                sys.stderr.write("Truncated payload in response frame\n")
+                break
+
+        full_resp_frame = header_bytes + payload_bytes
+        if verbose:
+            print_hexdump("RESPONSE FRAME RECEIVED", full_resp_frame, resp_hdr)
+
+        # Skip unknown frame types cleanly
+        if resp_hdr.type not in (FRAME_TYPE_DATA, FRAME_TYPE_HEADERS, FRAME_TYPE_PING, FRAME_TYPE_GOAWAY):
+            continue
+
+        if resp_hdr.type == FRAME_TYPE_HEADERS and payload_bytes:
+            try:
+                resp_headers = decode_headers(payload_bytes)
+                for k, v in resp_headers:
+                    if k == ":status":
+                        try:
+                            status_code = int(v)
+                        except ValueError:
+                            status_code = 500
+            except Exception as e:
+                sys.stderr.write(f"Header decoding error: {e}\n")
+
+        elif resp_hdr.type == FRAME_TYPE_DATA and payload_bytes:
+            sys.stdout.buffer.write(payload_bytes)
+            sys.stdout.buffer.flush()
+
+        if resp_hdr.flags & FLAG_END_STREAM:
+            break
+
+    sock.close()
+
+    # Exit non-zero on 4xx / 5xx error responses
+    if status_code >= 400:
+        sys.exit(1)
+
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()

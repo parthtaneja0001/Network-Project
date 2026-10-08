@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+import sys
+import os
+import socket
+from protocol import (
+    FRAME_HEADER_SIZE,
+    FRAME_TYPE_DATA,
+    FRAME_TYPE_HEADERS,
+    FRAME_TYPE_PING,
+    FRAME_TYPE_GOAWAY,
+    FLAG_END_STREAM,
+    FLAG_END_HEADERS,
+    FLAG_ACK,
+    FrameHeader,
+    read_exact,
+    encode_headers,
+    decode_headers
+)
+
+def send_error_response(sock: socket.socket, stream_id: int, status: str, message: str):
+    headers = [
+        (":status", status),
+        ("content-type", "text/plain")
+    ]
+    payload = encode_headers(headers)
+    
+    h_hdr = FrameHeader(len(payload), FRAME_TYPE_HEADERS, FLAG_END_HEADERS, stream_id)
+    sock.sendall(h_hdr.pack() + payload)
+    
+    msg_bytes = message.encode('utf-8')
+    d_hdr = FrameHeader(len(msg_bytes), FRAME_TYPE_DATA, FLAG_END_STREAM, stream_id)
+    sock.sendall(d_hdr.pack() + msg_bytes)
+
+def send_file_response(sock: socket.socket, stream_id: int, full_path: str):
+    if not os.path.isfile(full_path):
+        send_error_response(sock, stream_id, "404", "404 Not Found\n")
+        return
+
+    try:
+        file_size = os.path.getsize(full_path)
+        with open(full_path, "rb") as f:
+            content_type = "text/plain"
+            if full_path.endswith(".html"):
+                content_type = "text/html"
+            elif full_path.endswith(".json"):
+                content_type = "application/json"
+
+            headers = [
+                (":status", "200"),
+                ("content-length", str(file_size)),
+                ("content-type", content_type)
+            ]
+            payload = encode_headers(headers)
+
+            h_hdr = FrameHeader(len(payload), FRAME_TYPE_HEADERS, FLAG_END_HEADERS, stream_id)
+            sock.sendall(h_hdr.pack() + payload)
+
+            if file_size == 0:
+                d_hdr = FrameHeader(0, FRAME_TYPE_DATA, FLAG_END_STREAM, stream_id)
+                sock.sendall(d_hdr.pack())
+            else:
+                bytes_sent = 0
+                while bytes_sent < file_size:
+                    chunk = f.read(16384)
+                    if not chunk:
+                        break
+                    bytes_sent += len(chunk)
+                    is_last = (bytes_sent >= file_size)
+                    flags = FLAG_END_STREAM if is_last else 0x00
+                    d_hdr = FrameHeader(len(chunk), FRAME_TYPE_DATA, flags, stream_id)
+                    sock.sendall(d_hdr.pack() + chunk)
+    except Exception as e:
+        sys.stderr.write(f"Error serving file: {e}\n")
+        send_error_response(sock, stream_id, "500", "500 Internal Server Error\n")
+
+def handle_client(sock: socket.socket, root_dir: str):
+    abs_root = os.path.realpath(root_dir)
+    sys.stderr.write("Client connected. Keeping connection open...\n")
+
+    while True:
+        header_bytes = read_exact(sock, FRAME_HEADER_SIZE)
+        if not header_bytes or len(header_bytes) < FRAME_HEADER_SIZE:
+            sys.stderr.write("Client closed connection cleanly.\n")
+            break
+
+        try:
+            hdr = FrameHeader.unpack(header_bytes)
+        except ValueError as ve:
+            sys.stderr.write(f"Invalid header received: {ve}\n")
+            break
+
+        payload = b""
+        if hdr.length > 0:
+            payload = read_exact(sock, hdr.length)
+            if len(payload) < hdr.length:
+                sys.stderr.write("Premature EOF reading frame payload\n")
+                break
+
+        # Receiver meeting a frame type it does not know MUST skip it cleanly
+        if hdr.type not in (FRAME_TYPE_DATA, FRAME_TYPE_HEADERS, FRAME_TYPE_PING, FRAME_TYPE_GOAWAY):
+            sys.stderr.write(f"Received unknown frame type 0x{hdr.type:02X} (length: {hdr.length}). Skipping cleanly.\n")
+            continue
+
+        if hdr.type == FRAME_TYPE_PING:
+            ack_hdr = FrameHeader(hdr.length, FRAME_TYPE_PING, FLAG_ACK, hdr.stream_id)
+            sock.sendall(ack_hdr.pack() + payload)
+            continue
+
+        if hdr.type == FRAME_TYPE_GOAWAY:
+            sys.stderr.write("Received GOAWAY. Closing this connection.\n")
+            break
+
+        if hdr.type == FRAME_TYPE_HEADERS:
+            try:
+                headers = decode_headers(payload)
+            except Exception as e:
+                send_error_response(sock, hdr.stream_id, "400", "400 Bad Request: Malformed HEADERS frame\n")
+                continue
+
+            req_path = ""
+            req_method = "GET"
+            for k, v in headers:
+                key = k.lower()
+                if key == ":path":
+                    req_path = v
+                elif key == ":method":
+                    req_method = v.upper()
+
+            if req_method != "GET":
+                send_error_response(sock, hdr.stream_id, "400", "400 Bad Request: Only GET is supported\n")
+                continue
+
+            if not req_path or not req_path.startswith("/") or "\x00" in req_path:
+                send_error_response(sock, hdr.stream_id, "400", "400 Bad Request: Invalid path\n")
+                continue
+
+            if req_path == "/":
+                rel_path = "index.html"
+            else:
+                rel_path = req_path.lstrip("/")
+
+            target_file = os.path.realpath(os.path.join(abs_root, rel_path))
+
+            if os.path.commonpath([abs_root, target_file]) != abs_root:
+                send_error_response(sock, hdr.stream_id, "400", "400 Bad Request: Forbidden path traversal\n")
+                continue
+
+            sys.stderr.write(f"Processing Request: {req_method} {req_path} -> {target_file} (Stream {hdr.stream_id})\n")
+            send_file_response(sock, hdr.stream_id, target_file)
+
+    sock.close()
+
+def main():
+    if len(sys.argv) < 3:
+        sys.stderr.write(f"Usage: {sys.argv[0]} <root_dir> <port>\n")
+        sys.exit(1)
+
+    root_dir = sys.argv[1]
+    try:
+        port = int(sys.argv[2])
+    except ValueError:
+        sys.stderr.write(f"Invalid port: {sys.argv[2]}\n")
+        sys.exit(1)
+
+    if not os.path.isdir(root_dir):
+        sys.stderr.write(f"Root directory does not exist or is not a directory: {root_dir}\n")
+        sys.exit(1)
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", port))
+    server_sock.listen(10)
+
+    sys.stderr.write(f"bserve listening on 0.0.0.0:{port} serving {root_dir}\n")
+
+    try:
+        while True:
+            client_sock, client_addr = server_sock.accept()
+            handle_client(client_sock, root_dir)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nShutting down server.\n")
+    finally:
+        server_sock.close()
+
+if __name__ == "__main__":
+    main()
